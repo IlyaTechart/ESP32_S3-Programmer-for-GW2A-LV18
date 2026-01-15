@@ -1,0 +1,101 @@
+stages:
+  - pre-check
+  - build
+
+# Global variables
+variables:
+  EUB_APP_NAME: "bridge"
+
+
+# WORKFLOW RULES (global rules for when a pipeline should be triggered or not)
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"' # Run pipeline for merge request events.
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never # Do not run pipeline on push if there are open merge requests for the branch.
+    - if: '$CI_COMMIT_BRANCH' # Run pipeline for any push to the default branch.
+
+##############
+#  PRE CHECK #
+##############
+
+# Shared-CI-DangerJS (CI from external Gitlab repository)
+include:
+  - project: espressif/shared-ci-dangerjs
+    ref: master
+    file: danger.yaml
+run-danger-mr-linter:
+  stage: pre-check
+  tags:
+    - dangerjs
+  variables:
+    ENABLE_CHECK_UPDATED_CHANGELOG: 'false'
+
+pre_commit:
+  stage: pre-check
+  tags:
+    - build
+  image: python:3.11-bookworm
+  before_script:
+    - apt-get update
+    - apt-get install -y git
+  script:
+    - pip install pre-commit
+    - echo "Merge request is from ${CI_COMMIT_REF_NAME} into ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+    - git fetch origin ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME} ${CI_COMMIT_REF_NAME}
+    - export from_sha=$(git merge-base HEAD origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME})
+    - echo "Checking changes from ${from_sha} to ${CI_COMMIT_SHA}:"
+    - git log --oneline ${from_sha}..${CI_COMMIT_SHA}
+    - echo "Modified files:"
+    - git diff-tree --no-commit-id --name-only -r ${from_sha} ${CI_COMMIT_SHA}
+    - echo "Running pre-commit:"
+    - pre-commit run --from ${from_sha} --to ${CI_COMMIT_SHA}
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+################
+#  BUILD TESTS #
+################
+
+.build_template:
+  tags:
+    - build
+  script:
+    - PEDANTIC_FLAGS="-DIDF_CI_BUILD -Werror -Werror=deprecated-declarations -Werror=unused-variable -Werror=unused-but-set-variable -Werror=unused-function"
+    - export PEDANTIC_CFLAGS="${PEDANTIC_FLAGS} -Wstrict-prototypes"
+    - export PEDANTIC_CXXFLAGS="${PEDANTIC_FLAGS}"
+    - idf.py -DIDF_TARGET=${CHIP_NAME} -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.${EUB_DEBUG_IFACE}.defaults" build
+    - cd build
+    - esptool.py --chip ${CHIP_NAME} merge_bin -o ${EUB_APP_NAME}_merged.bin @flash_args
+  artifacts:
+    paths:
+      - build/flasher_args.json
+      - build/${EUB_APP_NAME}.elf
+      - build/${EUB_APP_NAME}.bin
+      - build/bootloader/bootloader.bin
+      - build/bootloader/bootloader.elf
+      - build/partition_table/partition-table.bin
+      - build/${EUB_APP_NAME}_merged.bin
+    expire_in: 2 weeks
+  needs:
+    - job: pre_commit
+      optional: true
+
+build_matrix:
+  extends: .build_template
+  stage: build
+  parallel:
+    matrix:
+      - CHIP_NAME: ["esp32s2", "esp32s3"]
+        EUB_DEBUG_IFACE: ["jtag", "swd"]
+        IDF_VERSION: [
+          "release-v5.0",
+          "release-v5.1",
+          "release-v5.2",
+          "release-v5.3",
+          "release-v5.4",
+          "release-v5.5",
+          "release-v6.0",
+          "latest"
+        ]
+  image: espressif/idf:${IDF_VERSION}

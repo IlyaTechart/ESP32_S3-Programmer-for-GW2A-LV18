@@ -1,0 +1,72 @@
+menu "Bridge Configuration"
+
+    config BRIDGE_USB_VID
+        hex "USB vendor ID"
+        default 0x303A
+        help
+            USB Vendor ID for the bridge device
+
+    config BRIDGE_USB_PID
+        hex "USB product ID"
+        default 0x1002
+        help
+            USB Product ID for the bridge device
+
+    config BRIDGE_MANUFACTURER
+        string "USB bridge manufacturer"
+        default "Espressif Systems Co. Ltd."
+        help
+            Manufacturer string shown in USB device descriptor
+
+    config BRIDGE_PRODUCT_NAME
+        string "USB product name"
+        default "ESP USB Bridge"
+        help
+            Product name string shown in USB device descriptor
+
+    config BRIDGE_GPIO_LED1
+        int "GPIO pin LED1"
+        default 12
+        help
+            GPIO pin for LED1 (typically TX activity indicator)
+
+    config BRIDGE_GPIO_LED2
+        int "GPIO pin LED2"
+        default 13
+        help
+            GPIO pin for LED2 (typically RX activity indicator)
+
+    config BRIDGE_GPIO_LED3
+        int "GPIO pin LED3"
+        default 14
+        help
+            GPIO pin for LED3 (typically debug activity indicator)
+
+    config BRIDGE_GPIO_LED1_ACTIVE
+        int "GPIO pin LED1 active value"
+        range 0 1
+        default 0
+        help
+            Logic level when LED1 is active (0=active low, 1=active high)
+
+    config BRIDGE_GPIO_LED2_ACTIVE
+        int "GPIO pin LED2 active value"
+        range 0 1
+        default 0
+        help
+            Logic level when LED2 is active (0=active low, 1=active high)
+
+    config BRIDGE_GPIO_LED3_ACTIVE
+        int "GPIO pin LED3 active value"
+        range 0 1
+        default 0
+        help
+            Logic level when LED3 is active (0=active low, 1=active high)
+
+    config BRIDGE_MSC_VOLUME_LABEL
+        string "Volume label shown in the MSC disc"
+        default "ESPPROG_MSC"
+        help
+            Volume label shown in the MSC disc. Max length is 11 ASCII characters.
+
+endmenu
