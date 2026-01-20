@@ -255,6 +255,8 @@ void assert_failed(const char *file, int line, const char *func, const char *exp
 
 void app_main(void)
 {
+    BaseType_t TaskReturned;
+
     init_led_gpios(); // Keep this at the beginning. LEDs are used for error reporting.
 
     init_serial_no();
@@ -270,10 +272,18 @@ void app_main(void)
     tusb_init();
     msc_init();
 
-    xTaskCreate(tusb_device_task, "tusb_device_task", 4 * 1024, NULL, 5, NULL);
+    TaskReturned = xTaskCreate(tusb_device_task, "tusb_device_task", 4 * 1024, NULL, 5, NULL);
+    if(TaskReturned != pdPASS)
+    {
+        assert_failed("main.c", 278, "TaskCreate", NULL);
+    }
 
     spi_slave_init();
-    xTaskCreate(spi_processing_task, "spi_proc", 16 * 1024, NULL, 5, NULL);
+    TaskReturned = xTaskCreate(spi_processing_task, "spi_proc", (4 * 1024 + BUFFER_SIZE / 4), NULL, 5, NULL);
+    if(TaskReturned != pdPASS)
+    {
+        assert_failed("main.c", 285, "TaskCreate", NULL);
+    }
 
 }
 

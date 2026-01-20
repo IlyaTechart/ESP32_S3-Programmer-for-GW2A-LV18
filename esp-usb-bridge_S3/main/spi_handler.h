@@ -10,9 +10,11 @@
 #define RCV_HOST    SPI2_HOST
 #define DMA_CHAN    SPI_DMA_CH_AUTO
 
+#define BUFFER_SIZE 2      
+
 // Структура нашего сообщения (для очереди)
 typedef struct {
-    uint8_t data[128]; // Буфер данных
+    uint8_t data[BUFFER_SIZE]; // Буфер данных
     size_t len;        // Длина
 } spi_message_t;
 
