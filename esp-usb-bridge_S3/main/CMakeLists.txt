@@ -12,7 +12,7 @@ idf_component_register(SRCS "spi_handler.c" "main.c"
                             "eub_vendord.c"
                             "serial_bridge.c"
                        REQUIRES ${dependencies}
-                       REQUIRES esp_driver_spi
+                       REQUIRES esp_driver_spi esp_mm
                        LDFRAGMENTS "noflash.lf"
                        INCLUDE_DIRS "." "public_include")
 

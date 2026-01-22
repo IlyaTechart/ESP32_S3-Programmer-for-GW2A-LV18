@@ -279,11 +279,21 @@ void app_main(void)
     }
 
     spi_slave_init();
-    TaskReturned = xTaskCreate(spi_processing_task, "spi_proc", (4 * 1024 + BUFFER_SIZE / 4), NULL, 5, NULL);
+
+    #if GEMINI_CODE
+    TaskReturned = xTaskCreate(spi_processing_task, "spi_proc", 10240, NULL, 10, NULL);
     if(TaskReturned != pdPASS)
     {
         assert_failed("main.c", 285, "TaskCreate", NULL);
     }
+    #else
+
+    TaskReturned = xTaskCreate(spi_slave_esp_idf, "spi_proc", (4 * 1024 + BUFFER_SIZE / 4), NULL, 5, NULL);
+    if(TaskReturned != pdPASS)
+    {
+        assert_failed("main.c", 285, "TaskCreate", NULL);
+    }
+    #endif
 
 }
 
