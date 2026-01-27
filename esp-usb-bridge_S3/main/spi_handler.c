@@ -24,13 +24,17 @@ SemaphoreHandle_t sema_for_driverTask;
 
 // Буферы для драйвера: HEAP_CAPS_DMA обязателен для DMA-capable памяти на ESP32S3
 // Выравнивание 16 байт требуется для L1CACHE на ESP32S3
-char *sendbuf = NULL;
-char *recvbuf = NULL;
 
-spi_message_t msg;
+volatile spi_buffers_t spi_buffers;
+EXT_RAM_BSS_ATTR volatile spi_message_t msg;
 
 //Переменные для логов 
 uint8_t LogBuffer[11] = {0};
+uint8_t LogFromDriverTask = 0;
+uint8_t LogFromISR = 0;
+uint8_t LogFromProcessingTask = 0;
+
+extern void assert_failed(const char *file, int line, const char *func, const char *expr);
 
 //Функции для логов 
 
@@ -38,22 +42,11 @@ uint8_t LogBuffer[11] = {0};
 void IRAM_ATTR my_post_setup_cb(spi_slave_transaction_t *trans);
 void IRAM_ATTR my_post_trans_cb(spi_slave_transaction_t *trans);
 static void spi_driver_task(void *pvParameters); // Внутренняя задача драйвера
+void memory_allocate(void);
 
 void spi_slave_init(void) {
 
-    // 0. Выделяем DMA-capable память с правильным выравниванием для ESP32S3 (16 байт)
-    sendbuf = heap_caps_aligned_alloc(32, BUFFER_SIZE, MALLOC_CAP_DMA);
-    recvbuf = heap_caps_aligned_alloc(32, BUFFER_SIZE, MALLOC_CAP_DMA);
-    
-    if (!sendbuf || !recvbuf) {
-        ESP_LOGE(TAG, "Failed to allocate DMA-capable buffers");
-        return;
-    }
-    
-    memset(sendbuf, 0, BUFFER_SIZE);
-    memset(recvbuf, 0, BUFFER_SIZE);
-    
-    ESP_LOGI(TAG, "RX buffer @ %p, TX buffer @ %p", recvbuf, sendbuf);
+     memory_allocate();
 
     // 1. Создаем очередь
     spi_evt_queue = xQueueCreate(1, 10);
@@ -70,7 +63,7 @@ void spi_slave_init(void) {
         .sclk_io_num = GPIO_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 65535,
+        .max_transfer_sz = CURRENT_SIZE + 1,
         .isr_cpu_id = ESP_INTR_CPU_AFFINITY_AUTO // Лучше AUTO
     };
 
@@ -78,7 +71,7 @@ void spi_slave_init(void) {
     spi_slave_interface_config_t slvcfg = {
         .mode = 0,
         .spics_io_num = GPIO_CS,
-        .queue_size = 10,
+        .queue_size = 2,
         .flags = 0,
         .post_setup_cb = my_post_setup_cb, 
         .post_trans_cb = my_post_trans_cb
@@ -96,10 +89,17 @@ void spi_slave_init(void) {
         ESP_LOGE(TAG, "Error creating semaphore");
         return;
     }
+    
+    // Выдаём семафор один раз, чтобы задача могла начать работу
+    xSemaphoreGive(sema_for_driverTask);
 
     // 5. ЗАПУСК ДРАЙВЕРА (Обязательно!)
     // Без этой задачи контроллер SPI не будет знать, куда принимать данные
-    xTaskCreate(spi_driver_task, "spi_driver", (4096 + BUFFER_SIZE / 4), NULL, 5, NULL);
+    BaseType_t TaskReturned = xTaskCreate(spi_driver_task, "spi_driver", (4096 + BUFFER_SIZE / 4), NULL, 10, NULL);
+    if(TaskReturned != pdPASS)
+    {
+        assert_failed("spi_driver_task: FAILED", 285, "TaskCreate", NULL);
+    }
 
 
     ESP_LOGI(TAG, "SPI Init done.");
@@ -112,13 +112,14 @@ static void spi_driver_task(void *pvParameters) {
 
     while (1) {
         // Очищаем буфер приема
-        memset(recvbuf, 0, BUFFER_SIZE);
+        memset(spi_buffers.pssram_rx_buffer, 0, BUFFER_SIZE);
 
         // Настраиваем транзакцию
-        t.length = BUFFER_SIZE * 8; // Размер в битах!
-        t.tx_buffer = sendbuf;
-        t.rx_buffer = recvbuf;
-        t.flags = SPI_SLAVE_TRANS_DMA_BUFFER_ALIGN_AUTO; // Разрешаем автопереаллокацию если нужна
+        t.length =  CURRENT_SIZE * 8; // Размер в битах!
+        t.tx_buffer = spi_buffers.pssram_tx_buffer;
+        t.rx_buffer = spi_buffers.pssram_rx_buffer;
+//        t.flags = SPI_SLAVE_TRANS_DMA_BUFFER_ALIGN_AUTO; // Разрешаем автопереаллокацию если нужна
+        LogFromDriverTask++;
 
         // Ждем данные от мастера
         volatile esp_err_t ret = spi_slave_transmit(RCV_HOST, &t, portMAX_DELAY);
@@ -133,6 +134,7 @@ static void spi_driver_task(void *pvParameters) {
 
 // Обработчик прерывания (вызывается ПОСЛЕ приема данных)
 void IRAM_ATTR my_post_trans_cb(spi_slave_transaction_t *trans) {
+    gpio_set_level(GPIO_HANDSHAKE, 1);
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     
     // Вычисляем сколько байт реально пришло
@@ -140,12 +142,15 @@ void IRAM_ATTR my_post_trans_cb(spi_slave_transaction_t *trans) {
     if (bytes_rcv > sizeof(msg.data)) bytes_rcv = sizeof(msg.data);
     
     // Копируем данные из буфера драйвера в сообщение очереди
-//    memcpy(msg.data, trans->rx_buffer, bytes_rcv);
-    msg.data = trans->rx_buffer;
+    memcpy(msg.data, trans->rx_buffer, bytes_rcv);
+    LogFromISR++;
+ //   msg.data = trans->rx_buffer;
     msg.len = bytes_rcv;
+ //   ESP_LOGE(TAG, "FORM ISR SPI LEN %lu", msg.len);
 
     // Отправляем в очередь
     xQueueSendFromISR(spi_evt_queue, &msg, &xHigherPriorityTaskWoken);
+    gpio_set_level(GPIO_HANDSHAKE, 0);
 
     if (xHigherPriorityTaskWoken) {
         portYIELD_FROM_ISR();
@@ -154,7 +159,7 @@ void IRAM_ATTR my_post_trans_cb(spi_slave_transaction_t *trans) {
 
 // Пустышка для setup (вызывается ПЕРЕД транзакцией)
 void IRAM_ATTR my_post_setup_cb(spi_slave_transaction_t *trans) {
-    gpio_set_level(GPIO_HANDSHAKE, 0);
+//    gpio_set_level(GPIO_HANDSHAKE, 0);
     // Здесь можно выставить GPIO в 1, чтобы сигнализировать Мастеру "Я готов"
 }
 
@@ -165,10 +170,10 @@ void spi_processing_task(void *pvParameters) {
 
     while(1) {
         // Ждем сообщения из очереди
-        
-         gpio_set_level(GPIO_HANDSHAKE, 1);
+        LogFromProcessingTask++;
         if((xQueueReceive(spi_evt_queue, &msg, portMAX_DELAY)) == pdPASS) {
-            for(uint32_t i = 0; i < BUFFER_SIZE; i++)
+
+            for(uint32_t i = 0; i < msg.len; i++)
             {
                 if(msg.data[i] == 0xAA)
                 {
@@ -187,6 +192,28 @@ void spi_processing_task(void *pvParameters) {
         }
     }
 }
+
+void memory_allocate(void)
+{
+    // Выделяем DMA-буферы из внутренней DRAM
+    spi_buffers.pssram_rx_buffer = (uint8_t*)heap_caps_aligned_alloc(32, BUFFER_SIZE,  MALLOC_CAP_DMA);
+    spi_buffers.pssram_tx_buffer = (uint8_t*)heap_caps_aligned_alloc(32, BUFFER_SIZE,  MALLOC_CAP_DMA);
+
+    if ((spi_buffers.pssram_rx_buffer == NULL) || (spi_buffers.pssram_tx_buffer == NULL)) {
+        ESP_LOGE(TAG, "Failed to allocate DMA buffers");
+        return;
+    }
+    
+    memset(spi_buffers.pssram_rx_buffer, 0, BUFFER_SIZE);
+    memset(spi_buffers.pssram_tx_buffer, 0, BUFFER_SIZE);
+
+    ESP_LOGI(TAG, "RX buffer @ 0x%p, TX buffer @ 0x%p", spi_buffers.pssram_rx_buffer, spi_buffers.pssram_tx_buffer);
+    
+    // Проверяем, что буферы действительно в DMA-capable памяти
+    multi_heap_info_t info = {0};
+    heap_caps_get_info(&info, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    ESP_LOGI(TAG, "DMA-capable SPIRAM: total=%zu, free=%zu", info.total_allocated_bytes + info.total_free_bytes, info.total_free_bytes);
+}
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -197,108 +224,162 @@ void spi_processing_task(void *pvParameters) {
 
 #if !GEMINI_CODE
 
-static const char *TAG = "SPI_HANDLER";
+static const char *TAG = "SPI_FAST";
 
-// Магическая функция из ROM для принудительной записи кэша в RAM
-extern void Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
+// --- НАСТРОЙКИ ---
+#define CHUNK_SIZE      4096       // Размер одного DMA буфера (Internal RAM)
+#define CHUNK_COUNT     8          // Количество буферов в кольце (запас прочности)
+#define TOTAL_FW_SIZE   (1024*1024) // 1 МБ итоговых данных
 
+// --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 
-//Called after a transaction is queued and ready for pickup by master. We use this to set the handshake line high.
-void my_post_setup_cb(spi_slave_transaction_t *trans)
-{
-    gpio_set_level(GPIO_HANDSHAKE, 1);
+// 1. Итоговое хранилище в PSRAM
+uint8_t *psram_firmware_buffer = NULL;
+volatile uint32_t fw_write_offset = 0;
+
+// 2. Буферы для DMA (Internal RAM)
+uint8_t *dma_chunks[CHUNK_COUNT];
+spi_slave_transaction_t trans_desc[CHUNK_COUNT]; // Дескрипторы транзакций
+
+// 3. Очередь для передачи индексов заполненных буферов от ISR к Задаче
+QueueHandle_t rcv_queue;
+
+// --- CALLBACK ПРЕРЫВАНИЯ ---
+// Вызывается, когда транзакция завершена (FPGA закончила передачу куска)
+void IRAM_ATTR my_post_trans_cb(spi_slave_transaction_t *trans) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    
+    // Получаем индекс буфера, который только что заполнился (мы сохранили его в trans->user)
+    int finished_buf_index = (int)trans->user;
+
+    // Отправляем индекс в очередь, чтобы задача забрала данные
+    xQueueSendFromISR(rcv_queue, &finished_buf_index, &xHigherPriorityTaskWoken);
+
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
 }
 
-//Called after transaction is sent/received. We use this to set the handshake line low.
-void my_post_trans_cb(spi_slave_transaction_t *trans)
-{
-    gpio_set_level(GPIO_HANDSHAKE, 0);
+void IRAM_ATTR my_post_setup_cb(spi_slave_transaction_t *trans) {
+    // Если нужен GPIO handshake, то тут поднимаем пин.
+    // Но для "слепого" приема от FPGA тут обычно ничего не делают.
 }
 
-char *sendbuf = NULL;
-char *recvbuf = NULL;
-
-void spi_slave_esp_idf(void *pvParameters) {
-        int n = 0;
+// --- ЗАДАЧА ОБРАБОТКИ ---
+void spi_processing_task(void *pvParameters) {
+    int buf_idx;
     esp_err_t ret;
 
-    //Configuration for the SPI bus
+    ESP_LOGI(TAG, "Processing task started. Waiting for data...");
+
+    while(1) {
+        // Ждем, пока ISR сообщит, что какой-то буфер заполнился
+        if (xQueueReceive(rcv_queue, &buf_idx, portMAX_DELAY)) {
+            
+            // 1. Узнаем, сколько байт реально пришло (обычно равно CHUNK_SIZE, если FPGA шлет потоком)
+            size_t bytes_received = trans_desc[buf_idx].trans_len / 8;
+            
+            // 2. Проверяем, влезет ли в PSRAM
+            if (fw_write_offset + bytes_received <= TOTAL_FW_SIZE) {
+                // КОПИРУЕМ из быстрого внутреннего буфера в медленный PSRAM
+                // memcpy здесь безопасен, так как мы не в прерывании
+                memcpy(&psram_firmware_buffer[fw_write_offset], dma_chunks[buf_idx], bytes_received);
+                fw_write_offset += bytes_received;
+                
+                // Лог каждые 4КБ, чтобы не спамить
+                if (fw_write_offset % (4*1024) == 0) {
+                    ESP_LOGI(TAG, "Received: %lu / %d bytes", fw_write_offset, TOTAL_FW_SIZE);
+                }
+            } else {
+                // Буфер переполнен, игнорируем или ставим флаг "Готово"
+                if (fw_write_offset < TOTAL_FW_SIZE + 1) { // Логируем только один раз
+                     ESP_LOGW(TAG, "Firmware buffer FULL!");
+                     fw_write_offset = TOTAL_FW_SIZE + 10; // Блокировка
+                }
+            }
+
+            // 3. САМОЕ ВАЖНОЕ: Вернуть буфер в работу!
+            // Мы очищаем длину (на всякий случай) и снова ставим транзакцию в очередь драйвера.
+            // Она встанет в "хвост" очереди аппаратного контроллера.
+            trans_desc[buf_idx].length = CHUNK_SIZE * 8; 
+            trans_desc[buf_idx].trans_len = 0; // Сброс принятой длины
+            
+            ret = spi_slave_queue_trans(RCV_HOST, &trans_desc[buf_idx], portMAX_DELAY);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to re-queue buffer %d", buf_idx);
+            }
+        }
+    }
+}
+
+// --- ИНИЦИАЛИЗАЦИЯ ---
+void spi_slave_init(void) {
+    esp_err_t ret;
+
+    // 1. Выделяем ОГРОМНЫЙ буфер в PSRAM
+    ESP_LOGI(TAG, "Allocating 1MB in PSRAM...");
+    psram_firmware_buffer = (uint8_t*)heap_caps_malloc(TOTAL_FW_SIZE, MALLOC_CAP_SPIRAM);
+    if (psram_firmware_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate PSRAM buffer!");
+        return; // Или abort()
+    }
+    memset(psram_firmware_buffer, 0, TOTAL_FW_SIZE);
+
+    // 2. Инициализация шины
     spi_bus_config_t buscfg = {
         .mosi_io_num = GPIO_MOSI,
         .miso_io_num = GPIO_MISO,
         .sclk_io_num = GPIO_SCLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
+        .max_transfer_sz = CHUNK_SIZE * 2, // Должен быть >= размера транзакции
+        .isr_cpu_id = ESP_INTR_CPU_AFFINITY_AUTO
     };
 
-    //Configuration for the SPI slave interface
     spi_slave_interface_config_t slvcfg = {
         .mode = 0,
         .spics_io_num = GPIO_CS,
-        .queue_size = 3,
+        .queue_size = CHUNK_COUNT, // ВАЖНО: Размер очереди драйвера равен числу наших чанков
         .flags = 0,
         .post_setup_cb = my_post_setup_cb,
         .post_trans_cb = my_post_trans_cb
     };
 
-    //Configuration for the handshake line
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = BIT64(GPIO_HANDSHAKE),
-    };
-
-    //Configure handshake line as output
-    gpio_config(&io_conf);
-    //Enable pull-ups on SPI lines so we don't detect rogue pulses when no master is connected.
-    gpio_set_pull_mode(GPIO_MOSI, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(GPIO_SCLK, GPIO_PULLUP_ONLY);
-    gpio_set_pull_mode(GPIO_CS, GPIO_PULLUP_ONLY);
-
-    //Initialize SPI slave interface
-    ret = spi_slave_initialize(RCV_HOST, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+    // ВАЖНО: Используем DMA_CHAN (SPI_DMA_CH_AUTO)
+    ret = spi_slave_initialize(RCV_HOST, &buscfg, &slvcfg, DMA_CHAN);
     assert(ret == ESP_OK);
 
-    // char *sendbuf = spi_bus_dma_memory_alloc(RCV_HOST, 129, 0);
-    // char *recvbuf = spi_bus_dma_memory_alloc(RCV_HOST, 129, 0);
+    // 3. Создаем очередь сообщений для Task
+    rcv_queue = xQueueCreate(CHUNK_COUNT, sizeof(int));
+
+    // 4. Аллоцируем DMA буферы и ПРЕДЗАГРУЖАЕМ их в драйвер
+    ESP_LOGI(TAG, "Allocating DMA chunks and queuing...");
     
-    //sendbuf = heap_caps_aligned_alloc(32, BUFFER_SIZE, MALLOC_CAP_DMA);
-    // recvbuf = heap_caps_aligned_alloc(32, BUFFER_SIZE, MALLOC_CAP_DMA);
-    //recvbuf = malloc(4);
-    sendbuf = heap_caps_aligned_alloc(32, BUFFER_SIZE, MALLOC_CAP_DMA);
-    recvbuf = heap_caps_aligned_alloc(32, BUFFER_SIZE, MALLOC_CAP_DMA);
+    for (int i = 0; i < CHUNK_COUNT; i++) {
+        // Выделяем память во ВНУТРЕННЕЙ (быстрой) RAM с поддержкой DMA
+        dma_chunks[i] = heap_caps_aligned_alloc(32, CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        assert(dma_chunks[i] != NULL);
+        memset(dma_chunks[i], 0, CHUNK_SIZE);
 
-    memset(sendbuf, 0x00, 4);
-    memset(recvbuf, 0x00, 4);
+        // Настраиваем дескриптор
+        memset(&trans_desc[i], 0, sizeof(spi_slave_transaction_t));
+        trans_desc[i].length = CHUNK_SIZE * 8; // Размер в битах
+        trans_desc[i].tx_buffer = NULL; // Мы только принимаем (или поставьте буфер если надо слать мусор)
+        trans_desc[i].rx_buffer = dma_chunks[i];
+        trans_desc[i].user = (void*)i; // Сохраняем индекс, чтобы узнать его в ISR
 
-    assert(sendbuf && recvbuf);
-    spi_slave_transaction_t t = {0};
-
-    while (1) {
-        //Clear receive buffer, set send buffer to something sane
-        memset(recvbuf, 0xA5, 4);
-        sprintf(sendbuf, "This is the receiver, sending data for transmission number %04d.", n);
-
-        //Cache_WriteBack_Addr((uint32_t)recvbuf, 4);
-
-        //Set up a transaction of 128 bytes to send/receive
-        t.length = 4 * 8;
-        t.tx_buffer = sendbuf;
-        t.rx_buffer = recvbuf;
-        /* This call enables the SPI slave interface to send/receive to the sendbuf and recvbuf. The transaction is
-        initialized by the SPI master, however, so it will not actually happen until the master starts a hardware transaction
-        by pulling CS low and pulsing the clock etc. In this specific example, we use the handshake line, pulled up by the
-        .post_setup_cb callback that is called as soon as a transaction is ready, to let the master know it is free to transfer
-        data.
-        */
-        ret = spi_slave_transmit(RCV_HOST, &t, portMAX_DELAY);
-
-        //spi_slave_transmit does not return until the master has done a transmission, so by here we have sent our data and
-        //received data from the master. Print it.
-        ESP_LOGI(TAG, "RX_Bufer_ISR: %d %d %d %d", recvbuf[0], recvbuf[1], recvbuf[2], recvbuf[3]);
-        n++;
+        // Ставим в очередь драйвера СРАЗУ
+        ret = spi_slave_queue_trans(RCV_HOST, &trans_desc[i], portMAX_DELAY);
+        assert(ret == ESP_OK);
     }
+
+    // 5. Запускаем задачу, которая будет разгребать данные
+    // Приоритет должен быть достаточно высоким, но ниже ISR
+    xTaskCreate(spi_processing_task, "spi_proc", 4096, NULL, 10, NULL);
+
+    ESP_LOGI(TAG, "SPI Slave Ready. Waiting for FPGA stream...");
 }
+
 
 
 #endif

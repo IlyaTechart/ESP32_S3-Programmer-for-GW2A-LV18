@@ -230,6 +230,16 @@ static void init_led_gpios(void)
     gpio_set_level(CONFIG_BRIDGE_GPIO_LED2, !CONFIG_BRIDGE_GPIO_LED2_ACTIVE);
     gpio_set_level(CONFIG_BRIDGE_GPIO_LED3, !CONFIG_BRIDGE_GPIO_LED3_ACTIVE);
 
+    gpio_config_t io_conf_debug = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = BIT64(GPIO_HANDSHAKE),  
+    };
+
+    //Configure handshake line as output
+    gpio_config(&io_conf_debug);
+    gpio_set_level(GPIO_HANDSHAKE, 0);
+
     ESP_LOGI(TAG, "LED GPIO init done");
 }
 
@@ -281,18 +291,18 @@ void app_main(void)
     spi_slave_init();
 
     #if GEMINI_CODE
-    TaskReturned = xTaskCreate(spi_processing_task, "spi_proc", 10240, NULL, 10, NULL);
+    TaskReturned = xTaskCreate(spi_processing_task, "spi_proc", 10240, NULL, 5, NULL);
     if(TaskReturned != pdPASS)
     {
         assert_failed("main.c", 285, "TaskCreate", NULL);
     }
     #else
 
-    TaskReturned = xTaskCreate(spi_slave_esp_idf, "spi_proc", (4 * 1024 + BUFFER_SIZE / 4), NULL, 5, NULL);
-    if(TaskReturned != pdPASS)
-    {
-        assert_failed("main.c", 285, "TaskCreate", NULL);
-    }
+    // TaskReturned = xTaskCreate(spi_slave_esp_idf, "spi_proc", (4 * 1024 + BUFFER_SIZE / 4), NULL, 5, NULL);
+    // if(TaskReturned != pdPASS)
+    // {
+    //     assert_failed("main.c", 285, "TaskCreate", NULL);
+    // }
     #endif
 
 }
